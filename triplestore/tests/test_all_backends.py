@@ -13,6 +13,7 @@ def main() -> int:
         "triplestore/tests/test_graphdb.py",
         "triplestore/tests/test_blazegraph.py",
         "triplestore/tests/test_allegrograph.py",
+        "triplestore/tests/test_qlever.py"
     ]
 
     # Allow passing through extra pytest args, e.g. -q or -k pattern

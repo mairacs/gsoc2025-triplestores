@@ -404,6 +404,55 @@ def test_named_graph():
     assert str(row["o"]).strip("<>") == OBJECT
 
 
+def test_select_star():
+    """Test SELECT *: verifies correct binding, completeness, and result integrity."""
+    store = Triplestore("qlever", config=config)
+    store.clear()
+
+    # Insert multiple triples
+    triples = [
+        ("http://example.org/s1", "http://example.org/p1", "http://example.org/o1"),
+        ("http://example.org/s2", "http://example.org/p2", "http://example.org/o2"),
+        ("http://example.org/s3", "http://example.org/p3", "http://example.org/o3"),
+    ]
+
+    for s, p, o in triples:
+        store.add(s, p, o)
+
+    # SELECT * query
+    results = store.query(
+        f"""
+        SELECT * WHERE {{
+            GRAPH <{config["graph"]}> {{
+                ?s ?p ?o
+            }}
+        }}
+        """
+    )
+
+    # Check number of results
+    assert len(results) == len(triples)
+
+    expected_rows = [{"s": s, "p": p, "o": o} for s, p, o in triples]
+
+    # Check that all variables are present in each row
+    for row in results:
+        assert set(row.keys()) == {"s", "p", "o"}
+
+    # Check that all values are valid (strings and not None)
+    for row in results:
+        for v in row.values():
+            assert isinstance(v, str)
+            assert v is not None
+
+    # Check exact match between expected and actual results (order-independent)
+    assert {tuple(sorted(r.items())) for r in results} == \
+           {tuple(sorted(r.items())) for r in expected_rows}
+
+    # Ensure no duplicate rows are returned
+    assert len(results) == len({tuple(sorted(r.items())) for r in results})
+
+
 def test_stop_server():
     store = Triplestore("qlever", config=config)
     store.stop_server()

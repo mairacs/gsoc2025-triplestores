@@ -217,7 +217,7 @@ def test_execute():
     assert store.execute(f"ASK WHERE {{ GRAPH <{graph}> {{ ?s ?p ?o }} }}") is False
 
 
-def test_select_star_returns_all_bound_variables_for_multiple_triples():
+def test_select_star():
     """Test SELECT *: verifies correct binding, completeness, and result integrity."""
     store = Triplestore("allegrograph", config=config)
     store.clear()
