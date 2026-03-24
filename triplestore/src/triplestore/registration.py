@@ -19,6 +19,7 @@ EXTRA_HINT = {
     "jena": "jena",
     "oxigraph": "oxigraph",
     "qlever": "qlever",
+    "rdf4j": "rdf4j",
 }
 
 
