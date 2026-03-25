@@ -39,6 +39,8 @@ qlever = ["requests>=2.32.4"]
 
 rdf4j = ["requests>=2.32.4"]
 
+virtuoso = ["requests>=2.32.4"]
+
 all = [
     "agraph-python>=104.3.0",
     "psutil>=7.0.0",
@@ -61,6 +63,7 @@ jena         = "triplestore.backends.jena:Jena"
 oxigraph     = "triplestore.backends.oxigraph:Oxigraph"
 qlever       = "triplestore.backends.qlever:QLever"
 rdf4j        = "triplestore.backends.rdf4j:RDF4J"
+virtuoso     = "triplestore.backends.virtuoso:Virtuoso"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

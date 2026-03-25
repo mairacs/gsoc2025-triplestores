@@ -1,0 +1,360 @@
+# Copyright (C) 2025 Maira Papadopoulou
+# SPDX-License-Identifier: Apache-2.0
+
+import logging
+import os
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import requests
+from requests.auth import HTTPDigestAuth
+
+from triplestore.base import TriplestoreBackend
+from triplestore.utils import validate_config
+
+logger = logging.getLogger(__name__)
+
+
+class Virtuoso(TriplestoreBackend):
+    """
+    A triplestore backend implementation for OpenLink Virtuoso using its HTTP SPARQL API.
+    """
+
+    REQUIRED_KEYS = {}
+    OPTIONAL_DEFAULTS = {
+        "base_url": "http://localhost:8890",
+        "graph": None,
+        "auth": None,
+        "name": "test"
+    }
+    ALIASES = {
+        "graph_uri": "graph",
+        "repository": "name",
+    }
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        """
+        Initialize the Virtuoso backend with the given configuration.
+
+        Parameters:
+        ----------
+        config : dict
+            Connection settings for the Virtuoso instance. Supported keys:
+            - base_url : str, optional
+                Base URL of the Virtuoso server (default: http://localhost:8890).
+            - name : str, optional
+                Logical repository name used as a fallback graph identifier.
+            - auth : tuple[str, str], optional
+                Credentials in the form (username, password).
+            - graph : str, optional
+                Named graph URI for scoping SPARQL operations.
+
+        Raises
+        ------
+        ValueError
+            If the provided `auth` value is invalid or if no credentials are
+            available via configuration or environment variables.
+        RuntimeError
+            If the Virtuoso SPARQL endpoint is unreachable.
+        """
+        configuration = validate_config(config, required_keys=self.REQUIRED_KEYS, optional_defaults=self.OPTIONAL_DEFAULTS,
+                                        alias_map=self.ALIASES, backend_name="Virtuoso")
+
+        super().__init__(configuration)
+        self.base_url = self._normalize_base_url(configuration["base_url"])
+        self.repository = configuration["name"]
+        self.graph_uri = configuration["graph"] or self._default_graph_uri(self.repository)
+
+        auth_cfg = configuration["auth"]
+        username: str | None = None
+        password: str | None = None
+
+        if auth_cfg is not None:
+            try:
+                username, password = auth_cfg
+            except Exception as e:
+                msg = (
+                    "[Virtuoso] Invalid value for 'auth' in config. "
+                    "Expected a tuple of the form (username, password).\n"
+                    'Example: auth=("dba", "dba")'
+                )
+                raise ValueError(msg) from e
+
+        if not username or not password:
+            env_user = os.getenv("VIRTUOSO_USERNAME")
+            env_pass = os.getenv("VIRTUOSO_PASSWORD")
+            if env_user and env_pass:
+                username, password = env_user, env_pass
+
+        if not username or not password:
+            msg = (
+                "[Virtuoso] No credentials found. "
+                "Please provide login details either:\n"
+                "  • in the config: auth=(username, password)\n"
+                "  • or via environment variables: VIRTUOSO_USERNAME / VIRTUOSO_PASSWORD\n"
+                "Without valid credentials, the connection to Virtuoso cannot be established."
+            )
+            raise ValueError(msg)
+        self.auth = HTTPDigestAuth(username, password)
+
+        self.query_url = f"{self.base_url}/sparql"
+        self.update_url = f"{self.base_url}/sparql-auth"
+        self.graph_store_url = f"{self.base_url}/sparql-graph-crud-auth"
+
+        self.headers_query = {"Accept": "application/sparql-results+json"}
+        self.headers_update = {"Content-Type": "application/sparql-update"}
+        self.headers_load = {"Content-Type": "text/turtle"}
+
+        self._ensure_endpoint_exists()
+
+    def load(self, filename: str) -> None:
+        """
+        Load RDF triples from a Turtle (.ttl) file into a Virtuoso named graph.
+
+        Parameters:
+        filename : str
+            Path to the Turtle (.ttl) file to be loaded.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the file does not exist.
+        RuntimeError
+            If the server returns an error status during data loading.
+        """
+        if not Path(filename).exists():
+            msg = f"[Virtuoso] File not found: {filename}"
+            raise FileNotFoundError(msg)
+
+        rdf_data = Path(filename).read_bytes()
+        params = {"graph-uri": self.graph_uri} if self.graph_uri else {}
+        response = requests.post(self.graph_store_url, headers=self.headers_load, params=params, data=rdf_data, auth=self.auth, timeout=None)
+
+        if response.status_code not in {200, 201, 204}:
+            msg = f"[Virtuoso] Load failed with status {response.status_code}:\n{response.text}"
+            raise RuntimeError(msg)
+
+    def add(self, s: str, p: str, o: str) -> None:
+        """
+        Add a triple to the Virtuoso store.
+
+        Parameters:
+        s : str
+            The subject URI of the triple.
+        p : str
+            The predicate URI of the triple.
+        o : str
+            The object URI of the triple.
+        """
+        triple = f"<{s}> <{p}> <{o}> ."
+        sparql = (
+            f"INSERT DATA {{ GRAPH <{self.graph_uri}> {{ {triple} }} }}"
+            if self.graph_uri
+            else f"INSERT DATA {{ {triple} }}"
+        )
+        self._run_update(sparql)
+
+    def delete(self, s: str, p: str, o: str) -> None:
+        """
+        Delete a triple from the Virtuoso store.
+
+        Parameters:
+        s : str
+            The subject URI of the triple to remove.
+        p : str
+            The predicate URI of the triple to remove.
+        o : str
+            The object URI of the triple to remove.
+        """
+        triple = f"<{s}> <{p}> <{o}> ."
+        sparql = (
+            f"DELETE DATA {{ GRAPH <{self.graph_uri}> {{ {triple} }} }}"
+            if self.graph_uri
+            else f"DELETE DATA {{ {triple} }}"
+        )
+        self._run_update(sparql)
+
+    def query(self, sparql: str) -> list[dict[str, str]]:
+        """
+        Execute a SPARQL query against the Virtuoso endpoint.
+
+        Parameters:
+        sparql : str
+            The SPARQL query string.
+
+        Returns:
+        list of dict
+            The list of query result bindings.
+
+        Raises
+        ------
+        RuntimeError
+            If the query fails or the server returns an error response.
+        """
+        response = requests.post(self.query_url, headers=self.headers_query, data={"query": sparql}, auth=self.auth, timeout=None)
+
+        if response.status_code != 200:
+            msg = f"[Virtuoso] SPARQL query failed: {response.status_code}\n{response.text}"
+            raise RuntimeError(msg)
+
+        data = response.json()
+        bindings = data.get("results", {}).get("bindings", [])
+        return [{k: v["value"] for k, v in row.items()} for row in bindings]
+
+    def execute(self, sparql: str) -> Any:
+        """
+        Execute any SPARQL query (SELECT, ASK, CONSTRUCT, DESCRIBE, UPDATE).
+
+        Parameters
+        ----------
+        sparql : str
+            The SPARQL query or update string.
+
+        Returns
+        -------
+        Any
+            - list of dict for SELECT
+            - bool for ASK
+            - str (Turtle RDF) for CONSTRUCT/DESCRIBE
+            - None for UPDATE operations
+
+        Raises
+        ------
+        RuntimeError
+            If the server responds with an error status.
+        """
+        lines = [line.strip() for line in sparql.strip().splitlines() if line.strip()]
+
+        query_type = ""
+        for line in lines:
+            upper = line.upper()
+            if upper.startswith(("PREFIX ", "BASE ")):
+                continue
+            query_type = line.split(None, 1)[0].upper()
+            break
+
+        # SELECT / ASK
+        if query_type in {"SELECT", "ASK"}:
+            response = requests.post(self.query_url, headers=self.headers_query, data={"query": sparql}, auth=self.auth, timeout=None)
+            if response.status_code != 200:
+                msg = f"[Virtuoso] Query failed {response.status_code}:\n{response.text}"
+                raise RuntimeError(msg)
+            data = response.json()
+            if query_type == "ASK":
+                return bool(data.get("boolean", False))
+            bindings = data.get("results", {}).get("bindings", [])
+            return [{k: v["value"] for k, v in row.items()} for row in bindings]
+
+        # CONSTRUCT / DESCRIBE
+        if query_type in {"CONSTRUCT", "DESCRIBE"}:
+            response = requests.post(self.query_url, headers={"Accept": "text/turtle"}, data={"query": sparql}, auth=self.auth, timeout=None)
+            if response.status_code != 200:
+                msg = f"[Virtuoso] Query failed {response.status_code}:\n{response.text}"
+                raise RuntimeError(msg)
+            return response.text
+
+        # UPDATE operations (INSERT, DELETE, CLEAR, DROP, LOAD, CREATE, etc.)
+        if query_type in {
+            "WITH", "INSERT", "DELETE", "LOAD", "CLEAR", "CREATE", "DROP",
+            "MOVE", "COPY", "ADD", "MODIFY",
+        }:
+            self._run_update(sparql)
+            return None
+
+        msg = f"[Virtuoso] Unsupported SPARQL keyword: {query_type}"
+        raise RuntimeError(msg)
+
+    def clear(self) -> None:
+        """
+        Remove all data from the configured Virtuoso graph.
+        """
+        sparql = (
+            f"CLEAR GRAPH <{self.graph_uri}>"
+            if getattr(self, "graph_uri", None)
+            else "CLEAR DEFAULT"
+        )
+        self._run_update(sparql)
+
+    def _run_update(self, sparql: str) -> None:
+        """
+        Execute a SPARQL update operation.
+
+        Parameters:
+        sparql : str
+            The SPARQL update string to be sent to the server.
+
+        Raises
+        ------
+        RuntimeError
+            If the update operation fails with a non-success status code.
+        """
+        response = requests.post(self.update_url, headers=self.headers_update, data=sparql.encode("utf-8"), auth=self.auth, timeout=None)
+        if response.status_code not in {200, 201, 204}:
+            msg = f"[Virtuoso] SPARQL update failed: {response.status_code}\n{response.text}"
+            raise RuntimeError(msg)
+
+    def _ensure_endpoint_exists(self) -> None:
+        """
+        Ensure that the configured Virtuoso SPARQL endpoint is reachable.
+
+        Raises
+        ------
+        RuntimeError
+            If unable to connect to the server or if the endpoint is inaccessible.
+        """
+        try:
+            response = requests.get(self.query_url, timeout=60, auth=self.auth)
+        except requests.RequestException as e:
+            msg = f"[Virtuoso] Could not connect to Virtuoso at {self.query_url}: {e}"
+            raise RuntimeError(msg) from e
+
+        if response.status_code in {200, 401, 403}:
+            return
+
+        msg = (
+            f"[Virtuoso] SPARQL endpoint check failed at {self.query_url}: "
+            f"HTTP {response.status_code}\n{response.text}"
+        )
+        raise RuntimeError(msg)
+
+    @staticmethod
+    def _normalize_base_url(base_url: str) -> str:
+        """
+        Normalize the configured base URL by removing any trailing slashes
+        and ensuring it does not end with a SPARQL-specific path (e.g. `/sparql`).
+
+        Parameters
+        ----------
+        base_url : str
+            The base URL of the Virtuoso server as provided in the configuration.
+
+        Returns
+        -------
+        str
+            The normalized base URL without trailing slashes or `/sparql` suffix.
+        """
+        return base_url.rstrip("/").removesuffix("/sparql")
+
+    @staticmethod
+    def _default_graph_uri(name: str) -> str:
+        """
+        Construct a default graph URI based on the provided repository name.
+
+        If the given name is already a valid absolute URI, it is returned as-is.
+        Otherwise, a fallback URI is generated under the `http://example.org/` namespace.
+
+        Parameters
+        ----------
+        name : str
+            The logical name of the repository or graph.
+
+        Returns
+        -------
+        str
+            A valid graph URI derived from the given name.
+        """
+        parsed = urlparse(name)
+        if parsed.scheme and parsed.netloc:
+            return name
+        return f"http://example.org/{name}"
