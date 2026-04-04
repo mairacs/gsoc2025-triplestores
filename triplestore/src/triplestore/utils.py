@@ -2,10 +2,13 @@ from __future__ import annotations
 
 # Copyright (C) 2025 Maira Papadopoulou
 # SPDX-License-Identifier: Apache-2.0
+import csv
+import json
 import logging
 import platform
 import subprocess
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -14,6 +17,27 @@ if TYPE_CHECKING:
 from triplestore.exceptions import TriplestoreMissingConfigValue
 
 logger = logging.getLogger(__name__)
+
+SPARQL_QUERY_FORMS = {"SELECT", "ASK", "CONSTRUCT", "DESCRIBE"}
+
+SPARQL_UPDATE_TYPES = {
+    "WITH", "INSERT", "DELETE", "LOAD", "CLEAR", "CREATE", "DROP",
+    "MOVE", "COPY", "ADD", "MODIFY",
+}
+
+SPARQL_DEFAULT_EXPORT_FORMATS = {
+    "SELECT": "json",
+    "ASK": "json",
+    "CONSTRUCT": "ttl",
+    "DESCRIBE": "ttl",
+}
+
+SPARQL_ALLOWED_EXPORT_FORMATS = {
+    "SELECT": {"json", "csv"},
+    "ASK": {"json", "txt"},
+    "CONSTRUCT": {"ttl"},
+    "DESCRIBE": {"ttl"},
+}
 
 
 def detect_host_url(port: int, path: str = "", fallback: str | None = None) -> str:
@@ -87,7 +111,7 @@ def validate_config(user_config: Mapping[str, Any], *, required_keys: Iterable[s
 
     Raises
     ------
-    ValueError
+    TriplestoreMissingConfigValue
         If one or more required keys are missing.
     """
 
@@ -125,3 +149,213 @@ def validate_config(user_config: Mapping[str, Any], *, required_keys: Iterable[s
         logger.warning(msg)
 
     return normalized_config
+
+
+def get_sparql_query_type(sparql: str) -> str:
+    """
+    Determine the top-level SPARQL query or update keyword.
+    This function extracts the first meaningful keyword of a SPARQL query/update string, ignoring
+    leading PREFIX, BASE declarations and comment lines.
+
+    Parameters
+    ----------
+    sparql : str
+        The SPARQL query or update string.
+
+    Returns
+    -------
+    str
+        The uppercase top-level SPARQL keyword (e.g., 'SELECT', 'INSERT', 'ASK').
+        Returns an empty string if no valid keyword can be determined.
+    """
+    lines = [line.strip() for line in sparql.strip().splitlines() if line.strip()]
+
+    for line in lines:
+        upper = line.upper()
+        if upper.startswith(("PREFIX ", "BASE ")):
+            continue
+        if upper.startswith("#"):
+            continue
+        return line.split(None, 1)[0].upper()
+
+    return ""
+
+
+def resolve_export_format(query_type: str, *, export: bool, output_format: str | None = None, backend_name: str = "backend") -> str | None:
+    """
+    Determine and validate the export format for a SPARQL query.
+    This function resolves the effective export format based on the query type and validates it against the supported formats for that type.
+
+    Parameters
+    ----------
+    query_type : str
+        The uppercase SPARQL query type.
+    export : bool
+        Whether export has been requested.
+    output_format : str | None, optional
+        Explicit export format requested by the user. If not provided, a default format is selected based on the query type.
+    backend_name : str, default="backend"
+        Backend name used in error messages.
+
+    Returns
+    -------
+    str | None
+        The normalized export format (lowercase, without leading dot), or None if export is False.
+
+    Raises
+    ------
+    ValueError
+        If export is requested for an unsupported query type or if the requested format is not allowed for the given query type.
+    """
+    if not export:
+        return None
+
+    if query_type not in SPARQL_DEFAULT_EXPORT_FORMATS:
+        msg = f"[{backend_name}] Unsupported export format '{output_format}' for {query_type} query. "
+        raise ValueError(msg)
+
+    chosen_format = (output_format or SPARQL_DEFAULT_EXPORT_FORMATS[query_type]).lower().lstrip(".")
+    allowed_formats = SPARQL_ALLOWED_EXPORT_FORMATS.get(query_type, set())
+
+    if chosen_format not in allowed_formats:
+        msg = (
+            f"[{backend_name}] Unsupported export format '{output_format}' for {query_type} query. "
+            f"Allowed formats: {sorted(allowed_formats)}"
+        )
+        raise ValueError(msg)
+
+    return chosen_format
+
+
+def export_select_results(results: list[dict[str, str]], output_format: str, filename: str | None = None, separator: str = ",", backend_name: str = "backend") -> Path:
+    """
+    Export SELECT query results to a local file.
+    This function serializes the variable bindings returned by a SELECT query and writes them to disk in the specified format.
+
+    Parameters
+    ----------
+    results : list[dict[str, str]]
+        The SELECT query result bindings, where each dictionary represents a result row mapping variable names to their string values.
+    output_format : str
+        Export format ('json' or 'csv').
+    filename : str, optional
+        Output filename with or without extension. If not provided, a default name ('results') is used.
+    separator : str, default=","
+        Column separator to use when exporting CSV files.
+    backend_name : str, default="backend"
+        Backend name used in error messages.
+
+    Returns
+    -------
+    Path
+        The path to the generated output file.
+
+    Raises
+    ------
+    ValueError
+        If the requested export format is not supported.
+    """
+    normalized_format = output_format.lower().lstrip(".")
+    output_name = filename or "results"
+    output_path = Path(output_name).with_suffix(f".{normalized_format}")
+
+    if normalized_format == "json":
+        output_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+        return output_path
+
+    if normalized_format == "csv":
+        fieldnames: list[str] = []
+        for row in results:
+            for key in row:
+                if key not in fieldnames:
+                    fieldnames.append(key)
+
+        with output_path.open("w", newline="", encoding="utf-8") as file_obj:
+            writer = csv.DictWriter(file_obj, fieldnames=fieldnames, delimiter=separator)
+            writer.writeheader()
+            writer.writerows(results)
+
+        return output_path
+
+    msg = f"[{backend_name}] Unsupported SELECT export format: {output_format}"
+    raise ValueError(msg)
+
+
+def export_ask_result(result: bool, output_format: str, filename: str | None = None, backend_name: str = "backend") -> Path:
+    """
+    Export an ASK query result to a local file.
+    This function serializes the boolean result of an ASK query into the requested format and writes it to disk.
+
+    Parameters
+    ----------
+    result : bool
+        The boolean result of the ASK query.
+    output_format : str
+        Export format ('json' or 'txt').
+    filename : str, optional
+        Output filename with or without extension. If not provided, a default name ('results') is used.
+    backend_name : str, default="backend"
+        Backend name used in error messages.
+
+    Returns
+    -------
+    Path
+        The path to the generated output file.
+
+    Raises
+    ------
+    ValueError
+        If the requested export format is not supported.
+    """
+    normalized_format = output_format.lower().lstrip(".")
+    output_name = filename or "results"
+    output_path = Path(output_name).with_suffix(f".{normalized_format}")
+
+    if normalized_format == "json":
+        output_path.write_text(json.dumps({"boolean": result}, indent=2, ensure_ascii=False), encoding="utf-8")
+        return output_path
+
+    if normalized_format == "txt":
+        output_path.write_text(str(result).lower(), encoding="utf-8")
+        return output_path
+
+    msg = f"[{backend_name}] Unsupported ASK export format: {output_format}"
+    raise ValueError(msg)
+
+
+def export_rdf_result(rdf_text: str, output_format: str, filename: str | None = None, backend_name: str = "backend") -> Path:
+    """
+    Export an RDF query result to a local file.
+    This function writes the RDF serialization produced by a SPARQL query (e.g., CONSTRUCT or DESCRIBE) to disk using the specified format.
+
+    Parameters
+    ----------
+    rdf_text : str
+        The RDF serialization returned by the query.
+    output_format : str
+        Export format ('ttl').
+    filename : str, optional
+        Output filename with or without extension. If not provided, a default name ('results') is used.
+    backend_name : str, default="backend"
+        Backend name used in error messages.
+
+    Returns
+    -------
+    Path
+        The path to the generated output file.
+
+    Raises
+    ------
+    ValueError
+        If the requested export format is not supported.
+    """
+    normalized_format = output_format.lower().lstrip(".")
+    output_name = filename or "results"
+    output_path = Path(output_name).with_suffix(f".{normalized_format}")
+
+    if normalized_format == "ttl":
+        output_path.write_text(rdf_text, encoding="utf-8")
+        return output_path
+
+    msg = f"[{backend_name}] Unsupported RDF export format: {output_format}"
+    raise ValueError(msg)
