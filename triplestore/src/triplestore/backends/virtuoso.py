@@ -11,7 +11,14 @@ import requests
 from requests.auth import HTTPDigestAuth
 
 from triplestore.base import TriplestoreBackend
-from triplestore.utils import validate_config
+from triplestore.utils import (
+    export_ask_result,
+    export_rdf_result,
+    export_select_results,
+    get_sparql_query_type,
+    resolve_export_format,
+    validate_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -175,23 +182,48 @@ class Virtuoso(TriplestoreBackend):
         )
         self._run_update(sparql)
 
-    def query(self, sparql: str) -> list[dict[str, str]]:
+    def query(self, sparql: str, *, export: bool = False, output_format: str = "json", filename: str | None = None, separator: str = ",") -> list[dict[str, str]]:
         """
-        Execute a SPARQL query against the Virtuoso endpoint.
+        Execute a SPARQL SELECT query against the Virtuoso endpoint.
 
-        Parameters:
+        Parameters
+        ----------
         sparql : str
             The SPARQL query string.
+        export : bool, optional
+            If True, also save the query results to a local file.
+        output_format : str, optional
+            Export format for saved results. Supported: 'json', 'csv'.
+        filename : str, optional
+            Output filename for exported results. The file extension is determined automatically from the requested export format.
+        separator : str, optional
+            Column separator to use when exporting CSV files. Defaults to ",".
 
-        Returns:
-        list of dict
+        Returns
+        -------
+        list[dict[str, str]]
             The list of query result bindings.
 
         Raises
         ------
+        ValueError
+            If query() is called with a non-SELECT query or with an unsupported export format.
         RuntimeError
             If the query fails or the server returns an error response.
         """
+        query_type = get_sparql_query_type(sparql)
+
+        if query_type != "SELECT":
+            msg = (
+                f"[Virtuoso] Unsupported query type '{query_type}' for query(). "
+                "Only SELECT queries are supported. "
+                "Use execute() for UPDATE queries or other query forms."
+            )
+            raise ValueError(msg)
+
+        if export:
+            chosen_format = resolve_export_format(query_type, export=export, output_format=output_format, backend_name="Virtuoso")
+
         response = requests.post(self.query_url, headers=self.headers_query, data={"query": sparql}, auth=self.auth, timeout=None)
 
         if response.status_code != 200:
@@ -200,9 +232,14 @@ class Virtuoso(TriplestoreBackend):
 
         data = response.json()
         bindings = data.get("results", {}).get("bindings", [])
-        return [{k: v["value"] for k, v in row.items()} for row in bindings]
+        results = [{k: v["value"] for k, v in row.items()} for row in bindings]
 
-    def execute(self, sparql: str) -> Any:
+        if export:
+            export_select_results(results, output_format=chosen_format, filename=filename, separator=separator, backend_name="Virtuoso")
+
+        return results
+
+    def execute(self, sparql: str, *, export: bool = False, output_format: str | None = None, filename: str | None = None, separator: str = ",") -> Any:
         """
         Execute any SPARQL query (SELECT, ASK, CONSTRUCT, DESCRIBE, UPDATE).
 
@@ -210,6 +247,14 @@ class Virtuoso(TriplestoreBackend):
         ----------
         sparql : str
             The SPARQL query or update string.
+        export : bool, optional
+            If True, also save the query result to a local file.
+        output_format : str, optional
+            Export format for saved results. If omitted and export=True, a default format is chosen based on the query type.
+        filename : str, optional
+            Output filename for exported results. The file extension is determined automatically from the requested export format.
+        separator : str, optional
+            Column separator to use when exporting CSV files. Defaults to ",".
 
         Returns
         -------
@@ -224,37 +269,47 @@ class Virtuoso(TriplestoreBackend):
         RuntimeError
             If the server responds with an error status.
         """
-        lines = [line.strip() for line in sparql.strip().splitlines() if line.strip()]
-
-        query_type = ""
-        for line in lines:
-            upper = line.upper()
-            if upper.startswith(("PREFIX ", "BASE ")):
-                continue
-            query_type = line.split(None, 1)[0].upper()
-            break
+        query_type = get_sparql_query_type(sparql)
+        chosen_format = resolve_export_format(query_type, export=export, output_format=output_format, backend_name="Virtuoso")
 
         # SELECT / ASK
         if query_type in {"SELECT", "ASK"}:
             response = requests.post(self.query_url, headers=self.headers_query, data={"query": sparql}, auth=self.auth, timeout=None)
+
             if response.status_code != 200:
                 msg = f"[Virtuoso] Query failed {response.status_code}:\n{response.text}"
                 raise RuntimeError(msg)
+
             data = response.json()
+
             if query_type == "ASK":
-                return bool(data.get("boolean", False))
+                result = bool(data.get("boolean", False))
+                if export:
+                    export_ask_result(result, output_format=chosen_format, filename=filename, backend_name="Virtuoso")
+                return result
+
             bindings = data.get("results", {}).get("bindings", [])
-            return [{k: v["value"] for k, v in row.items()} for row in bindings]
+            results = [{k: v["value"] for k, v in row.items()} for row in bindings]
+            if export:
+                export_select_results(results, output_format=chosen_format, filename=filename, separator=separator, backend_name="Virtuoso")
+
+            return results
 
         # CONSTRUCT / DESCRIBE
         if query_type in {"CONSTRUCT", "DESCRIBE"}:
             response = requests.post(self.query_url, headers={"Accept": "text/turtle"}, data={"query": sparql}, auth=self.auth, timeout=None)
+
             if response.status_code != 200:
                 msg = f"[Virtuoso] Query failed {response.status_code}:\n{response.text}"
                 raise RuntimeError(msg)
-            return response.text
 
-        # UPDATE operations (INSERT, DELETE, CLEAR, DROP, LOAD, CREATE, etc.)
+            rdf_text = response.text
+            if export:
+                export_rdf_result(rdf_text, output_format=chosen_format, filename=filename, backend_name="Virtuoso")
+
+            return rdf_text
+
+        # UPDATE operations
         if query_type in {
             "WITH", "INSERT", "DELETE", "LOAD", "CLEAR", "CREATE", "DROP",
             "MOVE", "COPY", "ADD", "MODIFY",
