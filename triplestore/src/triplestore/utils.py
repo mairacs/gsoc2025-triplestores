@@ -11,10 +11,11 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from triplestore.exceptions import TriplestoreMissingConfigValue
+from triplestore.utils_geo import export_geospatial_select_results
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
-
-from triplestore.exceptions import TriplestoreMissingConfigValue
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ SPARQL_DEFAULT_EXPORT_FORMATS = {
 }
 
 SPARQL_ALLOWED_EXPORT_FORMATS = {
-    "SELECT": {"json", "csv"},
+    "SELECT": {"json", "csv", "geojson", "kml", "kmz", "gml"},
     "ASK": {"json", "txt"},
     "CONSTRUCT": {"ttl"},
     "DESCRIBE": {"ttl"},
@@ -237,7 +238,7 @@ def export_select_results(results: list[dict[str, str]], output_format: str, fil
     results : list[dict[str, str]]
         The SELECT query result bindings, where each dictionary represents a result row mapping variable names to their string values.
     output_format : str
-        Export format ('json' or 'csv').
+        Export format ('json', 'csv', 'geojson', 'kml', 'kmz', or 'gml').
     filename : str, optional
         Output filename with or without extension. If not provided, a default name ('results') is used.
     separator : str, default=","
@@ -276,6 +277,10 @@ def export_select_results(results: list[dict[str, str]], output_format: str, fil
             writer.writerows(results)
 
         return output_path
+
+    if normalized_format in {"geojson", "kml", "kmz", "gml"}:
+        return export_geospatial_select_results(results,
+            output_format=normalized_format, output_path=output_path, backend_name=backend_name)
 
     msg = f"[{backend_name}] Unsupported SELECT export format: {output_format}"
     raise ValueError(msg)

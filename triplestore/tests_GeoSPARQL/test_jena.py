@@ -8,10 +8,14 @@ All operations are scoped within the named graph 'http://example.org/test',
 and use a local Jena Fuseki instance with REST API access.
 """
 
+import csv
+import json
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 
+import pytest
 import requests
 from triplestore import Triplestore
 
@@ -44,6 +48,10 @@ WHERE {{
   }}
 }}
 """
+
+
+TEST_FILES_DIR = Path(__file__).parent / "tests_files"
+TEST_FILES_DIR.mkdir(exist_ok=True)
 
 
 config = {
@@ -948,6 +956,558 @@ def test_execute_geosparql():
     clr_out = store.execute(clear_q)
     assert clr_out is None
     assert store.execute(f"ASK WHERE {{ GRAPH <{graph}> {{ ?s ?p ?o }} }}") is False
+
+
+def _load_basic_geosparql_dataset(store: Triplestore) -> None:
+    """Load a small GeoSPARQL dataset used by export-oriented tests."""
+    store.clear()
+    store.execute(f"""
+    {PREFIXES}
+    INSERT DATA {{
+      GRAPH <{GRAPH}> {{
+        ex:featureA a ex:Feature ;
+            geo:hasGeometry ex:geomA .
+
+        ex:geomA a geo:Geometry ;
+            geo:asWKT "{POINT_A}"^^geo:wktLiteral .
+
+        ex:featureB a ex:Feature ;
+            geo:hasGeometry ex:geomB .
+
+        ex:geomB a geo:Geometry ;
+            geo:asWKT "{POINT_B}"^^geo:wktLiteral .
+
+        ex:featureBox a ex:Feature ;
+            geo:hasGeometry ex:geomBox .
+
+        ex:geomBox a geo:Geometry ;
+            geo:asWKT "{POLYGON}"^^geo:wktLiteral .
+      }}
+    }}
+    """)
+
+
+def test_query_export_json_geosparql():
+    """Test that query() exports GeoSPARQL SELECT results to JSON correctly."""
+    store = Triplestore("jena", config=config)
+    _load_basic_geosparql_dataset(store)
+
+    output_file = TEST_FILES_DIR / "jena_geosparql_results_json"
+    results = store.query(SPARQL_QUERY, export=True, output_format="json", filename=str(output_file))
+
+    exported_path = TEST_FILES_DIR / "jena_geosparql_results_json.json"
+
+    assert exported_path.exists()
+    assert isinstance(results, list)
+    assert len(results) == 3
+
+    data = json.loads(exported_path.read_text(encoding="utf-8"))
+    assert data == results
+
+    normalized_rows = [
+        {
+            "feature": row["feature"].strip("<>"),
+            "geom": row["geom"].strip("<>"),
+            "wkt": row["wkt"],
+        }
+        for row in data
+    ]
+
+    expected_rows = [
+        {"feature": f"{EX}featureA", "geom": f"{EX}geomA", "wkt": POINT_A},
+        {"feature": f"{EX}featureB", "geom": f"{EX}geomB", "wkt": POINT_B},
+        {"feature": f"{EX}featureBox", "geom": f"{EX}geomBox", "wkt": POLYGON},
+    ]
+
+    assert {tuple(sorted(r.items())) for r in normalized_rows} == {
+        tuple(sorted(r.items())) for r in expected_rows
+    }
+
+
+def test_query_export_csv_geosparql():
+    """Test that query() exports GeoSPARQL SELECT results to CSV correctly."""
+    store = Triplestore("jena", config=config)
+    _load_basic_geosparql_dataset(store)
+
+    output_file = TEST_FILES_DIR / "jena_geosparql_results_csv"
+    results = store.query(SPARQL_QUERY, export=True, output_format="csv", filename=str(output_file))
+
+    exported_path = TEST_FILES_DIR / "jena_geosparql_results_csv.csv"
+
+    assert exported_path.exists()
+    assert isinstance(results, list)
+    assert len(results) == 3
+
+    with exported_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    assert len(rows) == 3
+
+    normalized_rows = [
+        {
+            "feature": row["feature"].strip("<>"),
+            "geom": row["geom"].strip("<>"),
+            "wkt": row["wkt"],
+        }
+        for row in rows
+    ]
+
+    expected_rows = [
+        {"feature": f"{EX}featureA", "geom": f"{EX}geomA", "wkt": POINT_A},
+        {"feature": f"{EX}featureB", "geom": f"{EX}geomB", "wkt": POINT_B},
+        {"feature": f"{EX}featureBox", "geom": f"{EX}geomBox", "wkt": POLYGON},
+    ]
+
+    assert {tuple(sorted(r.items())) for r in normalized_rows} == {
+        tuple(sorted(r.items())) for r in expected_rows
+    }
+
+
+def test_query_export_csv_with_custom_separator_geosparql():
+    """Test that query() exports GeoSPARQL SELECT results to CSV using a custom separator."""
+    store = Triplestore("jena", config=config)
+    _load_basic_geosparql_dataset(store)
+
+    output_file = TEST_FILES_DIR / "jena_geosparql_custom_separator"
+    results = store.query(SPARQL_QUERY, export=True, output_format="csv", filename=str(output_file), separator=";")
+
+    exported_path = TEST_FILES_DIR / "jena_geosparql_custom_separator.csv"
+
+    assert exported_path.exists()
+    assert isinstance(results, list)
+    assert len(results) == 3
+
+    content = exported_path.read_text(encoding="utf-8")
+    assert ";" in content
+
+    with exported_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f, delimiter=";")
+        rows = list(reader)
+
+    assert len(rows) == 3
+    assert set(rows[0].keys()) == {"feature", "geom", "wkt"}
+
+
+def test_query_export_empty_results_json_geosparql():
+    """Test exporting an empty GeoSPARQL SELECT result set to JSON."""
+    store = Triplestore("jena", config=config)
+    store.clear()
+
+    output_file = TEST_FILES_DIR / "jena_geosparql_empty_json"
+    results = store.query(
+        f"""
+        {PREFIXES}
+        SELECT ?feature ?geom ?wkt
+        WHERE {{
+          GRAPH <{GRAPH}> {{
+            <http://example.org/unknown> geo:hasGeometry ?geom .
+            ?geom geo:asWKT ?wkt .
+            BIND(<http://example.org/unknown> AS ?feature)
+          }}
+        }}
+        """,
+        export=True, output_format="json", filename=str(output_file),
+    )
+
+    exported_path = TEST_FILES_DIR / "jena_geosparql_empty_json.json"
+
+    assert results == []
+    assert exported_path.exists()
+
+    data = json.loads(exported_path.read_text(encoding="utf-8"))
+    assert data == []
+
+
+def test_query_rejects_non_select_geosparql():
+    """Test that query() rejects non-SELECT GeoSPARQL/SPARQL queries."""
+    store = Triplestore("jena", config=config)
+    store.clear()
+
+    with pytest.raises(ValueError, match=r"Only SELECT queries are supported"):
+        store.query(f"""
+        {PREFIXES}
+        ASK WHERE {{
+          GRAPH <{GRAPH}> {{
+            ?feature geo:hasGeometry ?geom .
+          }}
+        }}
+        """)
+
+
+def test_query_rejects_unsupported_export_format_geosparql():
+    """Test that query() rejects unsupported export formats for GeoSPARQL SELECT queries."""
+    store = Triplestore("jena", config=config)
+    store.clear()
+
+    with pytest.raises(ValueError, match="Unsupported export format"):
+        store.query(SPARQL_QUERY, export=True, output_format="ttl", filename=str(TEST_FILES_DIR / "bad_geo_output"))
+
+
+def test_execute_export_select_json_geosparql():
+    """Test that execute() exports GeoSPARQL SELECT results to JSON correctly."""
+    store = Triplestore("jena", config=config)
+    _load_basic_geosparql_dataset(store)
+
+    output_file = TEST_FILES_DIR / "execute_geosparql_select_json"
+    results = store.execute(SPARQL_QUERY, export=True, output_format="json", filename=str(output_file))
+
+    exported_path = TEST_FILES_DIR / "execute_geosparql_select_json.json"
+
+    assert exported_path.exists()
+    assert isinstance(results, list)
+    assert len(results) == 3
+
+    data = json.loads(exported_path.read_text(encoding="utf-8"))
+    assert data == results
+
+
+def test_execute_export_select_csv_geosparql():
+    """Test that execute() exports GeoSPARQL SELECT results to CSV correctly."""
+    store = Triplestore("jena", config=config)
+    _load_basic_geosparql_dataset(store)
+
+    output_file = TEST_FILES_DIR / "execute_geosparql_select_csv"
+    results = store.execute(SPARQL_QUERY, export=True, output_format="csv", filename=str(output_file))
+
+    exported_path = TEST_FILES_DIR / "execute_geosparql_select_csv.csv"
+
+    assert exported_path.exists()
+    assert isinstance(results, list)
+    assert len(results) == 3
+
+    with exported_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    assert len(rows) == 3
+    assert set(rows[0].keys()) == {"feature", "geom", "wkt"}
+
+
+def test_execute_export_ask_json_geosparql():
+    """Test that execute() exports GeoSPARQL ASK results to JSON correctly."""
+    store = Triplestore("jena", config=config)
+    _load_basic_geosparql_dataset(store)
+
+    output_file = TEST_FILES_DIR / "execute_geosparql_ask_json"
+    sparql = f"""
+    {PREFIXES}
+    ASK WHERE {{
+      GRAPH <{GRAPH}> {{
+        ex:featureA geo:hasGeometry ex:geomA .
+      }}
+    }}
+    """
+
+    result = store.execute(sparql, export=True, output_format="json", filename=str(output_file))
+
+    exported_path = TEST_FILES_DIR / "execute_geosparql_ask_json.json"
+
+    assert exported_path.exists()
+    assert result is True
+
+    data = json.loads(exported_path.read_text(encoding="utf-8"))
+    assert data == {"boolean": True}
+
+
+def test_execute_export_ask_txt_geosparql():
+    """Test that execute() exports GeoSPARQL ASK results to TXT correctly."""
+    store = Triplestore("jena", config=config)
+    _load_basic_geosparql_dataset(store)
+
+    output_file = TEST_FILES_DIR / "execute_geosparql_ask_txt"
+    sparql = f"""
+    {PREFIXES}
+    ASK WHERE {{
+      GRAPH <{GRAPH}> {{
+        ex:featureA geo:hasGeometry ex:geomA .
+      }}
+    }}
+    """
+
+    result = store.execute(sparql, export=True, output_format="txt", filename=str(output_file))
+
+    exported_path = TEST_FILES_DIR / "execute_geosparql_ask_txt.txt"
+
+    assert exported_path.exists()
+    assert result is True
+    assert exported_path.read_text(encoding="utf-8").strip() == "true"
+
+
+def test_execute_export_construct_ttl_geosparql():
+    """Test that execute() exports GeoSPARQL CONSTRUCT results to Turtle correctly."""
+    store = Triplestore("jena", config=config)
+    _load_basic_geosparql_dataset(store)
+
+    output_file = TEST_FILES_DIR / "execute_geosparql_construct"
+    sparql = f"""
+    {PREFIXES}
+    CONSTRUCT {{ ?feature geo:hasGeometry ?geom }}
+    WHERE {{
+      GRAPH <{GRAPH}> {{
+        ?feature geo:hasGeometry ?geom .
+      }}
+    }}
+    """
+
+    result = store.execute(sparql, export=True, output_format="ttl", filename=str(output_file))
+
+    exported_path = TEST_FILES_DIR / "execute_geosparql_construct.ttl"
+
+    assert exported_path.exists()
+    assert isinstance(result, str)
+
+    content = exported_path.read_text(encoding="utf-8")
+    assert content.splitlines() == result.splitlines()
+    assert "featureA" in content
+    assert "geomA" in content
+
+
+def test_execute_export_describe_ttl_geosparql():
+    """Test that execute() exports GeoSPARQL DESCRIBE results to Turtle correctly."""
+    store = Triplestore("jena", config=config)
+    _load_basic_geosparql_dataset(store)
+
+    output_file = TEST_FILES_DIR / "execute_geosparql_describe"
+    sparql = f"DESCRIBE <{SUBJECT}>"
+
+    result = store.execute(sparql, export=True, output_format="ttl", filename=str(output_file))
+
+    exported_path = TEST_FILES_DIR / "execute_geosparql_describe.ttl"
+
+    assert exported_path.exists()
+    assert isinstance(result, str)
+
+    content = exported_path.read_text(encoding="utf-8")
+    assert content.splitlines() == result.splitlines()
+    assert "featureA" in content
+    assert "geomA" in content
+    assert "hasGeometry" in content
+
+
+def test_execute_rejects_unsupported_export_format_for_ask_geosparql():
+    """Test that execute() rejects unsupported export formats for GeoSPARQL ASK queries."""
+    store = Triplestore("jena", config=config)
+    store.clear()
+
+    sparql = f"""
+    {PREFIXES}
+    ASK WHERE {{
+      GRAPH <{GRAPH}> {{
+        ?feature geo:hasGeometry ?geom .
+      }}
+    }}
+    """
+
+    with pytest.raises(ValueError, match="Unsupported export format"):
+        store.execute(sparql, export=True, output_format="csv", filename=str(TEST_FILES_DIR / "bad_geosparql_ask"))
+
+
+def test_execute_rejects_export_for_update_operations_geosparql():
+    """Test that execute() rejects export for GeoSPARQL update operations."""
+    store = Triplestore("jena", config=config)
+    store.clear()
+
+    sparql = f"""
+    {PREFIXES}
+    INSERT DATA {{
+      GRAPH <{GRAPH}> {{
+        ex:featureA a ex:Feature ;
+            geo:hasGeometry ex:geomA .
+        ex:geomA a geo:Geometry ;
+            geo:asWKT "{POINT_A}"^^geo:wktLiteral .
+      }}
+    }}
+    """
+
+    with pytest.raises(ValueError, match="Unsupported export format"):
+        store.execute(sparql, export=True, output_format="json", filename=str(TEST_FILES_DIR / "bad_geosparql_update"))
+
+
+def test_query_export_geojson_geosparql():
+    """Test that query() exports GeoSPARQL SELECT results to GeoJSON correctly."""
+    store = Triplestore("jena", config=config)
+    _load_basic_geosparql_dataset(store)
+
+    output_file = TEST_FILES_DIR / "jena_geosparql_results_geojson"
+    results = store.query(SPARQL_QUERY, export=True, output_format="geojson", filename=str(output_file))
+
+    exported_path = TEST_FILES_DIR / "jena_geosparql_results_geojson.geojson"
+
+    assert exported_path.exists()
+    assert isinstance(results, list)
+    assert len(results) == 3
+
+    data = json.loads(exported_path.read_text(encoding="utf-8"))
+    assert data["type"] == "FeatureCollection"
+    assert len(data["features"]) == 3
+
+    returned_features = {
+        feature["properties"]["feature"].strip("<>")
+        for feature in data["features"]
+    }
+    assert returned_features == {
+        f"{EX}featureA",
+        f"{EX}featureB",
+        f"{EX}featureBox",
+    }
+
+    for feature in data["features"]:
+        assert feature["type"] == "Feature"
+        assert "geometry" in feature
+        assert "properties" in feature
+        assert feature["geometry"]["type"] in {"Point", "Polygon"}
+
+
+def test_execute_export_geojson_geosparql():
+    """Test that execute() exports GeoSPARQL SELECT results to GeoJSON correctly."""
+    store = Triplestore("jena", config=config)
+    _load_basic_geosparql_dataset(store)
+
+    output_file = TEST_FILES_DIR / "execute_geosparql_select_geojson"
+    results = store.execute(SPARQL_QUERY, export=True, output_format="geojson", filename=str(output_file))
+
+    exported_path = TEST_FILES_DIR / "execute_geosparql_select_geojson.geojson"
+
+    assert exported_path.exists()
+    assert isinstance(results, list)
+    assert len(results) == 3
+
+    data = json.loads(exported_path.read_text(encoding="utf-8"))
+    assert data["type"] == "FeatureCollection"
+    assert len(data["features"]) == 3
+
+
+def test_query_export_geojson_rejects_non_geojson_values():
+    """Test that GeoJSON export fails when the SELECT results contain neither GeoJSON nor WKT."""
+    store = Triplestore("jena", config=config)
+    _load_basic_geosparql_dataset(store)
+
+    sparql = f"""
+    {PREFIXES}
+    SELECT ?feature ?geom
+    WHERE {{
+      GRAPH <{GRAPH}> {{
+        ?feature geo:hasGeometry ?geom .
+      }}
+    }}
+    """
+
+    with pytest.raises(ValueError, match="Cannot export SELECT results as geospatial data"):
+        store.query(sparql, export=True, output_format="geojson", filename=str(TEST_FILES_DIR / "bad_geosparql_geojson"))
+
+
+def test_query_export_empty_results_geojson():
+    """Test exporting an empty GeoSPARQL SELECT result set to GeoJSON."""
+    store = Triplestore("jena", config=config)
+    store.clear()
+
+    sparql = f"""
+    {PREFIXES}
+    SELECT ?feature ?wkt
+    WHERE {{
+      GRAPH <{GRAPH}> {{
+        <http://example.org/unknown> geo:hasGeometry ?geom .
+        ?geom geo:asWKT ?wkt .
+        BIND(<http://example.org/unknown> AS ?feature)
+      }}
+    }}
+    """
+
+    output_file = TEST_FILES_DIR / "jena_geosparql_empty_geojson"
+    results = store.query(sparql, export=True, output_format="geojson", filename=str(output_file))
+
+    exported_path = TEST_FILES_DIR / "jena_geosparql_empty_geojson.geojson"
+
+    assert results == []
+    assert exported_path.exists()
+
+    data = json.loads(exported_path.read_text(encoding="utf-8"))
+    assert data == {"type": "FeatureCollection", "features": []}
+
+
+def test_query_export_kml_geosparql():
+    """Test that query() exports GeoSPARQL SELECT results to KML correctly."""
+    store = Triplestore("jena", config=config)
+    _load_basic_geosparql_dataset(store)
+
+    output_file = TEST_FILES_DIR / "jena_geosparql_results_kml"
+    results = store.query(SPARQL_QUERY, export=True, output_format="kml", filename=str(output_file))
+
+    exported_path = TEST_FILES_DIR / "jena_geosparql_results_kml.kml"
+
+    assert exported_path.exists()
+    assert len(results) == 3
+
+    content = exported_path.read_text(encoding="utf-8")
+    assert "<kml" in content
+    assert "<Placemark>" in content
+    assert "<Point>" in content or "<Polygon>" in content
+
+
+def test_query_export_kmz_geosparql():
+    """Test that query() exports GeoSPARQL SELECT results to KMZ correctly."""
+    store = Triplestore("jena", config=config)
+    _load_basic_geosparql_dataset(store)
+
+    output_file = TEST_FILES_DIR / "jena_geosparql_results_kmz"
+    results = store.query(SPARQL_QUERY, export=True, output_format="kmz", filename=str(output_file))
+
+    exported_path = TEST_FILES_DIR / "jena_geosparql_results_kmz.kmz"
+
+    assert exported_path.exists()
+    assert isinstance(results, list)
+    assert len(results) == 3
+
+    with zipfile.ZipFile(exported_path, "r") as kmz_file:
+        names = kmz_file.namelist()
+        assert "doc.kml" in names
+
+        kml_content = kmz_file.read("doc.kml").decode("utf-8")
+        assert "<kml" in kml_content
+        assert "<Placemark>" in kml_content
+
+
+def test_execute_export_kmz_geosparql():
+    """Test that execute() exports GeoSPARQL SELECT results to KMZ correctly."""
+    store = Triplestore("jena", config=config)
+    _load_basic_geosparql_dataset(store)
+
+    output_file = TEST_FILES_DIR / "execute_geosparql_select_kmz"
+    results = store.execute(SPARQL_QUERY, export=True, output_format="kmz", filename=str(output_file))
+
+    exported_path = TEST_FILES_DIR / "execute_geosparql_select_kmz.kmz"
+
+    assert exported_path.exists()
+    assert isinstance(results, list)
+    assert len(results) == 3
+
+    with zipfile.ZipFile(exported_path, "r") as kmz_file:
+        names = kmz_file.namelist()
+        assert "doc.kml" in names
+
+        kml_content = kmz_file.read("doc.kml").decode("utf-8")
+        assert "<kml" in kml_content
+        assert "<Placemark>" in kml_content
+
+
+def test_query_export_gml_geosparql():
+    """Test that query() exports GeoSPARQL SELECT results to GML correctly."""
+    store = Triplestore("jena", config=config)
+    _load_basic_geosparql_dataset(store)
+
+    output_file = TEST_FILES_DIR / "jena_geosparql_results_gml"
+    results = store.query(SPARQL_QUERY, export=True, output_format="gml", filename=str(output_file))
+
+    exported_path = TEST_FILES_DIR / "jena_geosparql_results_gml.gml"
+
+    assert exported_path.exists()
+    assert len(results) == 3
+
+    content = exported_path.read_text(encoding="utf-8")
+    assert "FeatureCollection" in content
+    assert "featureMember" in content
+    assert "Point" in content or "Polygon" in content
 
 
 def test_stop_server():
