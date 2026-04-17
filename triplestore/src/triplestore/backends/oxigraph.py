@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from pyoxigraph import DefaultGraph, NamedNode, Quad, QueryBoolean, QueryTriples, RdfFormat, Store
+from pyoxigraph import BlankNode, DefaultGraph, Literal, NamedNode, Quad, QueryBoolean, QueryTriples, RdfFormat, Store
 
 from triplestore.base import TriplestoreBackend
 from triplestore.utils import (
@@ -15,6 +16,7 @@ from triplestore.utils import (
     get_sparql_query_type,
     resolve_export_format,
     validate_config,
+    validate_rdf_term,
 )
 
 
@@ -74,36 +76,49 @@ class Oxigraph(TriplestoreBackend):
                 self.store.bulk_load(f, RdfFormat.TURTLE, to_graph=DefaultGraph())
         self.store.optimize()
 
-    def add(self, subject: str, predicate: str, obj: str) -> None:
+    def add(self, subject: Any, predicate: Any, obj: Any) -> None:
         """
         Add a triple to the Oxigraph store.
 
-        Parameters:
-        subject : str
-            The subject URI of the triple.
-        predicate : str
-            The predicate URI of the triple.
-        obj : str
-            The object URI of the triple.
+        Parameters
+        ----------
+        subject : Any
+            The subject value of the triple. Must serialize to an RDF IRI or blank node.
+        predicate : Any
+            The predicate value of the triple. Must serialize to an RDF IRI.
+        obj : Any
+            The object value of the triple. May serialize to an RDF IRI, blank node, or literal.
         """
-        gterm = NamedNode(self.graph_uri) if self.graph_uri else DefaultGraph()
-        quad = Quad(NamedNode(subject), NamedNode(predicate), NamedNode(obj), gterm)
+        graph_term = NamedNode(self.graph_uri) if self.graph_uri else DefaultGraph()
+        quad = Quad(
+            _to_oxigraph_term(subject, "subject", "Oxigraph"),
+            _to_oxigraph_term(predicate, "predicate", "Oxigraph"),
+            _to_oxigraph_term(obj, "object", "Oxigraph"),
+            graph_term,
+        )
         self.store.add(quad)
 
-    def delete(self, subject: str, predicate: str, obj: str) -> None:
+    def delete(self, subject: Any, predicate: Any, obj: Any) -> None:
         """
         Delete a triple from the Oxigraph store.
 
-        Parameters:
-        subject : str
-            The subject URI of the triple to remove.
-        predicate : str
-            The predicate URI of the triple to remove.
-        obj : str
-            The object URI of the triple to remove.
+        Parameters
+        ----------
+        subject : Any
+            The subject value of the triple. Must serialize to an RDF IRI or blank node.
+        predicate : Any
+            The predicate value of the triple. Must serialize to an RDF IRI.
+        obj : Any
+            The object value of the triple. May serialize to an RDF IRI, blank node, or literal.
         """
-        gterm = NamedNode(self.graph_uri) if self.graph_uri else DefaultGraph()
-        quad = Quad(NamedNode(subject), NamedNode(predicate), NamedNode(obj), gterm)
+        graph_term = NamedNode(self.graph_uri) if self.graph_uri else DefaultGraph()
+
+        quad = Quad(
+            _to_oxigraph_term(subject, "subject", "Oxigraph"),
+            _to_oxigraph_term(predicate, "predicate", "Oxigraph"),
+            _to_oxigraph_term(obj, "object", "Oxigraph"),
+            graph_term,
+        )
         self.store.remove(quad)
 
     def query(self, sparql: str, *, export: bool = False, output_format: str = "json", filename: str | None = None, separator: str = ",") -> list[dict[str, str]]:
@@ -267,3 +282,65 @@ class Oxigraph(TriplestoreBackend):
             self.store.clear_graph(NamedNode(self.graph_uri))
         else:
             self.store.clear_graph(DefaultGraph())
+
+
+def _to_oxigraph_term(term: Any, position: str, backend_name: str = "Oxigraph"):
+    """
+    Convert a Python value into a corresponding Oxigraph RDF term.
+
+    Parameters
+    ----------
+    term : Any
+        The Python value to convert.
+    position : str
+        The RDF triple position: 'subject', 'predicate', or 'object'.
+    backend_name : str, default="Oxigraph"
+        Backend name used in error messages.
+
+    Returns
+    -------
+    NamedNode | BlankNode | Literal
+        The corresponding Oxigraph RDF term.
+
+    Raises
+    ------
+    ValueError
+        If any triple component is invalid for its RDF position or cannot be converted into a supported Oxigraph RDF term.
+    """
+    validate_rdf_term(term, position, backend_name)
+
+    # Blank node (allowed only for subject and object)
+    if position in {"subject", "object"} and isinstance(term, str) and term.startswith("_:"):
+        return BlankNode(term[2:])
+
+    # IRI or plain string literal
+    if isinstance(term, str):
+        if term.startswith(("http://", "https://")):
+            return NamedNode(term)
+        return Literal(term)
+
+    # Primitive literals
+    if isinstance(term, (bool, int, float)):
+        return Literal(term)
+
+    # Mapping-based literals (typed or language-tagged)
+    if isinstance(term, Mapping):
+        value = term["value"]
+        datatype = term.get("datatype")
+        lang = term.get("lang")
+
+        if datatype is not None:
+            return Literal(str(value), datatype=NamedNode(datatype))
+
+        if lang is not None:
+            return Literal(str(value), language=lang)
+
+        return Literal(str(value))
+
+    # Unsupported type
+    msg = (
+        f"[{backend_name}] Unsupported RDF term: {term!r}\n"
+        "Expected an IRI string, blank node identifier, Python literal, "
+        "or literal mapping."
+    )
+    raise ValueError(msg)

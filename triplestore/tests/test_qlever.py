@@ -155,6 +155,133 @@ def test_query_roundtrip_add():
     assert count == 1
 
 
+def test_add_delete_with_literal_object():
+    """Test add()/delete() with a plain string literal object."""
+    store = Triplestore("qlever", config=config)
+    store.clear()
+
+    s = "http://example.org/person1"
+    p = "http://example.org/name"
+    o = "Alice"
+
+    store.add(s, p, o)
+
+    results = store.query(
+        f"""
+        SELECT ?o WHERE {{
+            GRAPH <{config["graph"]}> {{
+                <{s}> <{p}> ?o
+            }}
+        }}
+        """
+    )
+
+    assert len(results) == 1
+    assert results[0]["o"] == "Alice"
+
+    store.delete(s, p, o)
+
+    results_after_delete = store.query(
+        f"""
+        SELECT ?o WHERE {{
+            GRAPH <{config["graph"]}> {{
+                <{s}> <{p}> ?o
+            }}
+        }}
+        """
+    )
+    assert results_after_delete == []
+
+
+def test_add_delete_with_typed_and_lang_literals():
+    """Test add()/delete() with typed and language-tagged literal objects."""
+    store = Triplestore("qlever", config=config)
+    store.clear()
+
+    s1 = "http://example.org/person2"
+    p1 = "http://example.org/age"
+    o1 = 25
+
+    s2 = "http://example.org/person3"
+    p2 = "http://example.org/label"
+    o2 = {"value": "hallo", "lang": "de"}
+
+    store.add(s1, p1, o1)
+    store.add(s2, p2, o2)
+
+    results = store.query(
+        f"""
+        SELECT ?s ?p ?o WHERE {{
+            GRAPH <{config["graph"]}> {{
+                ?s ?p ?o
+            }}
+        }}
+        """
+    )
+
+    assert any(r["s"] == s1 and r["p"] == p1 and r["o"] == "25" for r in results)
+    assert any(r["s"] == s2 and r["p"] == p2 and r["o"] == "hallo" for r in results)
+
+    store.delete(s1, p1, o1)
+    store.delete(s2, p2, o2)
+
+    results_after_delete = store.query(
+        f"""
+        SELECT ?s ?p ?o WHERE {{
+            GRAPH <{config["graph"]}> {{
+                ?s ?p ?o
+            }}
+        }}
+        """
+    )
+
+    assert not any(r["s"] == s1 and r["p"] == p1 and r["o"] == "25" for r in results_after_delete)
+    assert not any(r["s"] == s2 and r["p"] == p2 and r["o"] == "hallo" for r in results_after_delete)
+
+
+def test_add_delete_with_blank_node_subject():
+    """Test add()/delete() with a blank node as subject."""
+    store = Triplestore("qlever", config=config)
+    store.clear()
+
+    s = "_:b1"
+    p = "http://example.org/name"
+    o = "Anonymous"
+
+    store.add(s, p, o)
+
+    results = store.query(
+        f"""
+        SELECT ?s ?o WHERE {{
+            GRAPH <{config["graph"]}> {{
+                ?s <{p}> ?o
+            }}
+        }}
+        """
+    )
+
+    assert len(results) == 1
+    assert results[0]["o"] == "Anonymous"
+
+    with pytest.raises(ValueError, match="Cannot delete triples using a blank node as subject."):
+        store.delete(s, p, o)
+
+
+def test_add_rejects_invalid_rdf_positions():
+    """Test that add() rejects literals as subjects and non-IRI predicates."""
+    store = Triplestore("qlever", config=config)
+    store.clear()
+
+    with pytest.raises(ValueError, match="subject of an RDF triple cannot be a literal"):
+        store.add("Alice", "http://example.org/name", "Bob")
+
+    with pytest.raises(ValueError, match="predicate of an RDF triple must be an IRI"):
+        store.add("http://example.org/person4", "_:p1", "Bob")
+
+    with pytest.raises(ValueError, match="predicate of an RDF triple must be an IRI"):
+        store.add("http://example.org/person4", "name", "Bob")
+
+
 def test_query_returns_empty_when_no_match():
     """Test that a SPARQL query returns no results when no match exists."""
     store = Triplestore("qlever", config=config)

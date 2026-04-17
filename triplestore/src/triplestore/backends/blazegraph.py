@@ -15,6 +15,7 @@ from triplestore.utils import (
     get_sparql_query_type,
     resolve_export_format,
     validate_config,
+    validate_rdf_term,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,19 +91,23 @@ class Blazegraph(TriplestoreBackend):
             msg = f"[Blazegraph] Load failed: {response.status_code}\n{response.text}"
             raise RuntimeError(msg)
 
-    def add(self, s: str, p: str, o: str) -> None:
+    def add(self, s: Any, p: Any, o: Any) -> None:
         """
         Add a triple to the Blazegraph store.
 
         Parameters:
-        s : str
-            Subject URI.
-        p : str
-            Predicate URI.
-        o : str
-            Object URI.
+        s : Any
+            The subject value of the triple. Must serialize to an RDF IRI or blank node.
+        p : Any
+            The predicate value of the triple. Must serialize to an RDF IRI.
+        o : Any
+            The object value of the triple. May serialize to an RDF IRI, blank node, or literal.
         """
-        triple = f"<{s}> <{p}> <{o}> ."
+        s_term = validate_rdf_term(s, "subject", "Blazegraph")
+        p_term = validate_rdf_term(p, "predicate", "Blazegraph")
+        o_term = validate_rdf_term(o, "object", "Blazegraph")
+
+        triple = f"{s_term} {p_term} {o_term} ."
         sparql = (
             f"INSERT DATA {{ GRAPH <{self.graph_uri}> {{ {triple} }} }}"
             if self.graph_uri else
@@ -110,19 +115,39 @@ class Blazegraph(TriplestoreBackend):
         )
         self._run_update(sparql)
 
-    def delete(self, s: str, p: str, o: str) -> None:
+    def delete(self, s: Any, p: Any, o: Any) -> None:
         """
         Delete a triple from the Blazegraph store.
 
         Parameters:
-        s : str
-            Subject URI.
-        p : str
-            Predicate URI.
-        o : str
-            Object URI.
+        s : Any
+            The subject value of the triple. Must serialize to an RDF IRI or blank node.
+        p : Any
+            The predicate value of the triple. Must serialize to an RDF IRI.
+        o : Any
+            The object value of the triple. May serialize to an RDF IRI, blank node, or literal.
+
+        Raises
+        ------
+        ValueError
+            If a blank node is provided as the subject.
         """
-        triple = f"<{s}> <{p}> <{o}> ."
+        s_term = validate_rdf_term(s, "subject", "Blazegraph")
+        p_term = validate_rdf_term(p, "predicate", "Blazegraph")
+        o_term = validate_rdf_term(o, "object", "Blazegraph")
+
+        if isinstance(s, str) and s.startswith("_:"):
+            msg = (
+                "[Blazegraph] Cannot delete triples using a blank node as subject.\n\n"
+                "Blank node identifiers (e.g. '_:b1') are local to a single SPARQL query "
+                "or update and do not represent stable, reusable identifiers.\n"
+                "Recommended alternatives:\n"
+                " - Use a persistent IRI instead of a blank node if you need to delete the triple later.\n"
+                " - Or delete using a pattern-based query (e.g. DELETE WHERE) that matches the triple.\n\n"
+            )
+            raise ValueError(msg)
+
+        triple = f"{s_term} {p_term} {o_term} ."
         sparql = (
             f"DELETE DATA {{ GRAPH <{self.graph_uri}> {{ {triple} }} }}"
             if self.graph_uri else
