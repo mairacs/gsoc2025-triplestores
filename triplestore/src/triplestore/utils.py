@@ -6,16 +6,14 @@ import csv
 import json
 import logging
 import platform
+import re
 import subprocess
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from triplestore.exceptions import TriplestoreMissingConfigValue
 from triplestore.utils_geo import export_geospatial_select_results
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -364,3 +362,247 @@ def export_rdf_result(rdf_text: str, output_format: str, filename: str | None = 
 
     msg = f"[{backend_name}] Unsupported RDF export format: {output_format}"
     raise ValueError(msg)
+
+
+XSD_NS = "http://www.w3.org/2001/XMLSchema#"
+
+
+def serialize_rdf_term(term: Any, backend_name: str = "backend") -> str:
+    """
+    Convert a Python value into a valid SPARQL RDF term.
+
+    Supported inputs:
+    -----------------
+    - IRI strings starting with http:// or https://
+    - Blank node identifiers starting with "_:"
+    - Plain literal values: str, int, float, bool
+    - Mapping objects for advanced literals:
+        {
+            "value": "...",
+            "datatype": "http://...",
+            "lang": "en"
+        }
+
+    Returns
+    -------
+    str
+        A SPARQL-compatible RDF term.
+
+    Raises
+    ------
+    ValueError
+        If the value cannot be converted into a valid RDF term.
+    """
+    # 1. None is invalid
+    if term is None:
+        msg = (
+            f"[{backend_name}] Invalid RDF term: received None.\n"
+            "RDF terms cannot be null. Expected one of:\n"
+            "  - IRI string (e.g. 'http://example.org/resource')\n"
+            "  - Blank node (e.g. '_:b1')\n"
+            "  - Literal value (str, int, float, bool)\n"
+            "  - Literal mapping (e.g. {'value': 'Alice', 'lang': 'en'})\n"
+            "Check that you are not passing an uninitialized variable or missing value."
+        )
+        raise ValueError(msg)
+
+    # 2. IRI
+    if isinstance(term, str) and term.startswith(("http://", "https://")):
+        if any(ch in term for ch in (" ", "<", ">", '"', "\n", "\r", "\t")):
+            msg = (
+                f"[{backend_name}] Invalid RDF IRI: {term!r}\n"
+                "The provided value looks like an IRI, but contains invalid characters.\n\n"
+                "IRIs must:\n"
+                "  - start with 'http://' or 'https://'\n"
+                "  - not contain spaces or control characters\n"
+                "  - not include '<', '>', or '\"' (these are added automatically in SPARQL)\n\n"
+                "Examples of valid IRIs:\n"
+                "  - http://example.org/Alice\n"
+            )
+            raise ValueError(msg)
+        return f"<{term}>"
+
+    # 3. Blank node
+    if isinstance(term, str) and term.startswith("_:"):
+        if not re.fullmatch(r"_:[A-Za-z0-9_]+", term):
+            msg = (
+                f"[{backend_name}] Invalid RDF blank node identifier: {term!r}\n"
+                "The provided value is intended to be a blank node, but its format is invalid.\n\n"
+                "Blank node identifiers must:\n"
+                "  - start with '_:'\n"
+                "  - be followed by letters, digits, or underscores only\n"
+                "  - not contain spaces or special characters\n\n"
+                "Examples of valid blank nodes:\n"
+                "  - _:b1\n"
+            )
+            raise ValueError(msg)
+        return term
+
+    # 4. Boolean
+    if isinstance(term, bool):
+        return f'"{str(term).lower()}"^^<{XSD_NS}boolean>'
+
+    # 5. Integer
+    if isinstance(term, int):
+        return f'"{term}"^^<{XSD_NS}integer>'
+
+    # 6. Float
+    if isinstance(term, float):
+        return f'"{term}"^^<{XSD_NS}double>'
+
+    # 7. Advanced literal (Mapping)
+    if isinstance(term, Mapping):
+        value = term.get("value")
+        datatype = term.get("datatype")
+        lang = term.get("lang")
+
+        if value is None:
+            msg = (
+                f"[{backend_name}] Invalid literal mapping: missing 'value'.\n"
+                "A literal mapping must always define a 'value' key.\n\n"
+                "Expected examples:\n"
+                "  - {'value': 'Alice'}\n"
+                "  - {'value': 'Alice', 'lang': 'en'}\n"
+                "  - {'value': '25', 'datatype': 'http://www.w3.org/2001/XMLSchema#integer'}"
+            )
+            raise ValueError(msg)
+
+        if datatype and lang:
+            msg = (
+                f"[{backend_name}] Invalid literal mapping: both 'datatype' and 'lang' were provided.\n"
+                "An RDF literal can be either:\n"
+                '  - a datatype literal (e.g. "25"^^xsd:integer), or\n'
+                '  - a language-tagged literal (e.g. "hello"@en),\n'
+                "but not both at the same time.\n\n"
+            )
+            raise ValueError(msg)
+
+        escaped = _escape_literal(str(value))
+
+        if datatype is not None:
+            if not isinstance(datatype, str) or not datatype.startswith(("http://", "https://")):
+                msg = (
+                    f"[{backend_name}] Invalid datatype IRI: {datatype!r}\n"
+                    "The 'datatype' field must be a full IRI string starting with "
+                    "'http://' or 'https://'.\n\n"
+                    "Example:\n"
+                    "  {'value': '25', 'datatype': 'http://www.w3.org/2001/XMLSchema#integer'}"
+                )
+                raise ValueError(msg)
+            if any(ch in datatype for ch in (" ", "<", ">", '"', "\n", "\r", "\t")):
+                msg = (
+                    f"[{backend_name}] Invalid datatype IRI: {datatype!r}\n"
+                    "Datatype IRIs must not contain spaces, quotes, angle brackets, "
+                    "or control characters.\n\n"
+                )
+                raise ValueError(msg)
+            return f'"{escaped}"^^<{datatype}>'
+
+        if lang is not None:
+            if not isinstance(lang, str) or not re.fullmatch(r"[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*", lang):
+                msg = (
+                    f"[{backend_name}] Invalid language tag: {lang!r}\n"
+                    "The 'lang' field must be a valid language tag such as:\n"
+                    "  - en\n"
+                    "  - en-GB\n"
+                    "Example:\n"
+                    "  {'value': 'hello', 'lang': 'en'}"
+                )
+                raise ValueError(msg)
+            return f'"{escaped}"@{lang}'
+
+        return f'"{escaped}"'
+
+    # 8. String literal
+    if isinstance(term, str):
+        return f'"{_escape_literal(term)}"'
+
+    # 9. Unsupported type
+    msg = (
+        f"[{backend_name}] Unsupported RDF term type: {type(term).__name__}\n"
+        f"Received value: {term!r}\n\n"
+        "This value cannot be converted into a valid RDF term.\n\n"
+        "Supported input types are:\n"
+        "  - IRI string (e.g. 'http://example.org/resource')\n"
+        "  - Blank node identifier (e.g. '_:b1')\n"
+        "  - Literal values:\n"
+        "      • str (e.g. 'Alice')\n"
+        "      • int (e.g. 25)\n"
+        "      • float (e.g. 3.14)\n"
+        "      • bool (e.g. True / False)\n"
+        "  - Literal mapping (e.g. {'value': 'Alice', 'lang': 'en'})\n\n"
+    )
+    raise ValueError(msg)
+
+
+def validate_rdf_term(term: Any, position: str, backend_name: str = "backend") -> str:
+    """
+    Validate that a Python value is allowed in the given RDF triple position
+    and return its serialized SPARQL RDF term.
+
+    Parameters
+    ----------
+    term : Any
+        The Python value to validate.
+    position : str
+        The RDF triple position: 'subject', 'predicate', or 'object'.
+    backend_name : str, default="backend"
+        Backend name used in error messages.
+
+    Returns
+    -------
+    str
+        The validated RDF term serialized in SPARQL-compatible form.
+
+    Raises
+    ------
+    ValueError
+        If the position is invalid or if the term is not allowed in that RDF position.
+    """
+    serialized = serialize_rdf_term(term, backend_name=backend_name)
+
+    is_iri = serialized.startswith("<") and serialized.endswith(">")
+    is_literal = serialized.startswith('"')
+
+    if position == "subject":
+        if is_literal:
+            msg = (
+                f"[{backend_name}] Invalid RDF subject: {term!r}\n"
+                "The subject of an RDF triple cannot be a literal.\n\n"
+                "A subject must be one of:\n"
+                "  - an IRI string (e.g. 'http://example.org/Alice')\n"
+                "  - a blank node identifier (e.g. '_:b1')\n\n"
+                "Examples of valid RDF subjects:\n"
+                "  - http://example.org/Alice\n"
+                "  - _:b1\n\n"
+            )
+            raise ValueError(msg)
+        return serialized
+
+    if position == "predicate":
+        if not is_iri:
+            msg = (
+                f"[{backend_name}] Invalid RDF predicate: {term!r}\n"
+                "The predicate of an RDF triple must be an IRI.\n\n"
+                "Predicates represent properties or relationships, so RDF does not allow "
+                "literals or blank nodes in predicate position.\n\n"
+                "A valid predicate must be an IRI string such as:\n"
+                "  - 'http://example.org/knows'\n"
+                "  - 'http://example.org/age'\n\n"
+            )
+            raise ValueError(msg)
+        return serialized
+
+    if position == "object":
+        return serialized
+
+
+def _escape_literal(value: str) -> str:
+    return (
+        value
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
