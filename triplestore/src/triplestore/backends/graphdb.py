@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -73,8 +76,6 @@ class GraphDB(TriplestoreBackend):
         self.headers_update = {"Content-Type": "application/sparql-update"}
         self.headers_load = {"Content-Type": "text/turtle"}
 
-        self._ensure_repository_exists()
-
     def load(self, filename: str) -> None:
         """
         Load RDF triples from a Turtle (.ttl) file into the GraphDB repository.
@@ -94,6 +95,8 @@ class GraphDB(TriplestoreBackend):
             msg = f"[GraphDB] File not found: {filename}"
             raise FileNotFoundError(msg)
 
+        self._ensure_repository_exists()
+
         rdf_data = Path(filename).read_bytes()
         params = {}
         if self.graph_uri:
@@ -104,51 +107,106 @@ class GraphDB(TriplestoreBackend):
             msg = f"[GraphDB] Load failed with status {response.status_code}:\n{response.text}"
             raise RuntimeError(msg)
 
-    def bulk_load(self, filenames: str | list[str], *, target_graph: str | None = None) -> None:
+    def bulk_load(self, filenames: str | list[str], mode: str = "load", repository_id: str | None = None) -> None:
         """
-        Bulk-load one or more RDF files that already exist on the GraphDB server.
+        Bulk-load RDF data into GraphDB using the offline ImportRDF tool.
 
         Parameters
         ----------
         filenames : str or list[str]
-            Server-side file path(s), relative to the GraphDB import directory.
-        target_graph : str, optional
-            Named graph URI for this import. If omitted, the graph configured for this backend
-            instance is used. If neither is set, GraphDB uses its default import behavior.
+            One or more local RDF files or directories to import.
+        mode : str, default="load"
+            Import mode. Must be either "load" or "preload".
+        repository_id : str, optional
+            Repository ID to import into. If omitted, the configured backend repository name is used.
 
         Raises
         ------
         ValueError
-            If no server-side file paths are provided.
+            If `mode` is invalid or no input files are provided.
+        FileNotFoundError
+            If one of the input paths does not exist, or if the ImportRDF executable cannot be found.
         RuntimeError
-            If the bulk-load request fails or the server returns a non-success status.
+            If the GraphDB server appears to be running or if the import fails.
         """
-        file_names = [filenames] if isinstance(filenames, str) else [name for name in filenames if name]
-
-        if not file_names:
+        if mode not in {"load", "preload"}:
             msg = (
-                "[GraphDB] bulk_load() requires at least one non-empty server-side file path. "
-                "Ensure that the file exists in the GraphDB import directory."
+                f"[GraphDB] bulk_load() received an invalid mode: '{mode}'. "
+                "Supported modes are 'load' and 'preload'. "
+                "Use 'load' for standard import or 'preload' for optimized bulk loading."
             )
             raise ValueError(msg)
 
-        payload = {"fileNames": file_names}
+        paths = [filenames] if isinstance(filenames, (str, os.PathLike)) else filenames
+        if not paths or (len(paths) == 1 and not paths[0]):
+            msg = (
+                "[GraphDB] bulk_load() received no input paths. "
+                "Expected a file path or a list of paths to RDF files or directories.\n"
+                "Example: bulk_load('data.ttl')"
+            )
+            raise ValueError(msg)
 
-        graph = target_graph if target_graph is not None else self.graph_uri
-        if graph:
-            payload["importSettings"] = {"context": graph}
+        normalized_paths: list[str] = []
+        for item in paths:
+            path = Path(item)
+            if not path.exists():
+                msg = (
+                    f"[GraphDB] bulk_load() could not find the input path: '{path}'. "
+                    "Please ensure that the file or directory exists and the path is correct.\n"
+                    "Example: bulk_load('data.ttl') or bulk_load(['/path/to/data.ttl'])"
+                )
+                raise FileNotFoundError(msg)
+            normalized_paths.append(str(path.resolve()))
 
-        import_url = f"{self.base_url}/rest/repositories/{self.repository}/import/server"
+        repo_id = repository_id or self.repository
+
+        graphdb_home = os.environ.get("GRAPHDB_HOME")
+        if graphdb_home:
+            importrdf = Path(graphdb_home).expanduser().resolve() / "bin" / "importrdf"
+            if not importrdf.exists():
+                msg = (
+                    f"[GraphDB] 'GRAPHDB_HOME' is set to '{graphdb_home}', but the 'importrdf' "
+                    f"executable was not found at: {importrdf}.\n"
+                    "Ensure that GRAPHDB_HOME points to a valid GraphDB installation directory "
+                    "containing 'bin/importrdf'."
+                )
+                raise FileNotFoundError(msg)
+            importrdf_path = str(importrdf)
+        else:
+            importrdf_path = shutil.which("importrdf")
+            if not importrdf_path:
+                msg = (
+                    "[GraphDB] Unable to locate the 'importrdf' executable.\n"
+                    "Set the 'GRAPHDB_HOME' environment variable to your GraphDB installation directory "
+                    "or ensure that 'importrdf' is available on your system PATH."
+                )
+                raise FileNotFoundError(msg)
 
         try:
-            response = requests.post(import_url, json=payload, auth=self.auth, timeout=None)
-        except requests.RequestException as e:
-            msg = f"[GraphDB] Bulk load request failed: {e}"
-            raise RuntimeError(msg) from e
+            response = requests.get(self.base_url, timeout=3, auth=self.auth)
+            if response.ok:
+                msg = (
+                    f"[GraphDB] bulk_load() cannot run while the GraphDB server is active at '{self.base_url}'. "
+                    "The ImportRDF tool requires the server to be fully stopped before execution.\n"
+                    "Please stop the GraphDB server and try again."
+                )
+                raise RuntimeError(msg)
+        except requests.RequestException:
+            pass
 
-        if response.status_code not in {200, 201, 202, 204}:
-            msg = f"[GraphDB] Bulk load failed with status {response.status_code}:\n{response.text}"
-            raise RuntimeError(msg)
+        command = [importrdf_path, mode, "-f", "-i", repo_id]
+        if mode == "load":
+            command.extend(["-m", "parallel"])
+        command.extend(normalized_paths)
+
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.strip() if exc.stderr else ""
+            stdout = exc.stdout.strip() if exc.stdout else ""
+            details = stderr or stdout or str(exc)
+            msg = f"[GraphDB] Bulk Load failed:\n{details}"
+            raise RuntimeError(msg) from exc
 
     def add(self, s: Any, p: Any, o: Any) -> None:
         """
@@ -253,6 +311,8 @@ class GraphDB(TriplestoreBackend):
         if export:
             chosen_format = resolve_export_format(query_type, export=export, output_format=output_format, backend_name="GraphDB")
 
+        self._ensure_repository_exists()
+
         response = requests.post(self.query_url, headers=self.headers_query, data={"query": sparql}, auth=self.auth, timeout=None)
 
         if response.status_code != 200:
@@ -300,6 +360,8 @@ class GraphDB(TriplestoreBackend):
         """
         query_type = get_sparql_query_type(sparql)
         chosen_format = resolve_export_format(query_type, export=export, output_format=output_format, backend_name="GraphDB")
+
+        self._ensure_repository_exists()
 
         # SELECT / ASK
         if query_type in {"SELECT", "ASK"}:
@@ -370,6 +432,8 @@ class GraphDB(TriplestoreBackend):
         RuntimeError
             If the update operation fails with a non-success status code.
         """
+        self._ensure_repository_exists()
+
         response = requests.post(self.update_url, headers=self.headers_update, data=sparql, auth=self.auth, timeout=None)
         if response.status_code not in {200, 204, 201}:
             msg = f"[GraphDB] SPARQL update failed: {response.status_code}\n{response.text}"
@@ -385,7 +449,7 @@ class GraphDB(TriplestoreBackend):
         RuntimeError
             If unable to connect to the server or if repository creation fails.
         """
-        check_url = f"{self.base_url}/repositories/{self.repository}"
+        check_url = f"{self.base_url}/rest/repositories/{self.repository}"
 
         try:
             response = requests.get(check_url, timeout=300, auth=self.auth)
@@ -407,13 +471,6 @@ class GraphDB(TriplestoreBackend):
         except requests.RequestException as e:
             msg = f"[GraphDB] Could not connect to GraphDB at {check_url}: {e}"
             raise RuntimeError(msg) from e
-
-        try:
-            delete_url = f"{self.base_url}/repositories/{self.repository}"
-            requests.delete(delete_url, timeout=300, auth=self.auth)
-        except requests.RequestException as err:
-            msg = f"[GraphDB] Failed to delete repo {self.repository} silently: {err}"
-            logger.debug(msg)
 
         create_url = f"{self.base_url}/rest/repositories"
 
